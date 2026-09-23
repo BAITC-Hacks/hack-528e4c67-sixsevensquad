@@ -10,6 +10,40 @@ from .schemas import Clause, Document, Side
 MAX_BYTES = 10 * 1024 * 1024
 NUMBER = re.compile(r"^(\d+(?:\.\d+)+)\.?\s*(.*)$")
 
+def pdf_blocks(content: str, page: int) -> list[tuple[str, str]]:
+    """Reassemble PDF text runs; retain page and physical line provenance.
+
+    Some PDF writers emit one word per line. Newlines are therefore not
+    paragraph boundaries. Numbered clauses and list markers are boundaries.
+    """
+    boundaries = {0, len(content)}
+    for match in re.finditer(r"(?<!\S)\d+(?:\.\d+)+\.?\s+(?=\S)", content):
+        line_start = content.rfind("\n", 0, match.start()) + 1
+        at_line_start = not content[line_start:match.start()].strip()
+        if at_line_start or content[match.end()].isupper():
+            boundaries.add(match.start())
+    for match in re.finditer(r"(?m)^[ \t]*[а-яА-Я][.)][ \t]+(?=\S)", content):
+        boundaries.add(match.start())
+    positions = sorted(boundaries)
+    blocks = []
+    for start, end in zip(positions, positions[1:]):
+        # Bound long unnumbered sections without dropping or rewriting words.
+        cursor = start
+        while cursor < end:
+            stop = min(cursor + 6000, end)
+            if stop < end:
+                whitespace = max(content.rfind(" ", cursor, stop), content.rfind("\n", cursor, stop))
+                if whitespace > cursor:
+                    stop = whitespace
+            raw = content[cursor:stop]
+            text = re.sub(r"\s+", " ", raw).strip()
+            if text:
+                first = content.count("\n", 0, cursor) + 1
+                last = content.count("\n", 0, stop) + 1
+                blocks.append((f"стр. {page}, строки {first}–{last}", text))
+            cursor = stop
+    return blocks
+
 def parse_document(name: str, data: bytes, side: Side, document_id: str) -> Document:
     name = Path(name.replace("\\", "/")).name
     if not data or len(data) > MAX_BYTES:
@@ -43,7 +77,7 @@ def parse_document(name: str, data: bytes, side: Side, document_id: str) -> Docu
             content = page.extract_text() or ""
             if len(content.strip()) < 10:
                 raise ValueError(f"PDF: страница {i} без текста. Сначала выполните OCR; неполный анализ запрещён")
-            blocks.extend((f"стр. {i}, строка {j}", line) for j, line in enumerate(content.splitlines(), 1))
+            blocks.extend(pdf_blocks(content, i))
     elif suffix == ".xlsx":
         from openpyxl import load_workbook
         book = load_workbook(io.BytesIO(data), read_only=True, data_only=False)

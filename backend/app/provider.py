@@ -38,10 +38,19 @@ class OpenAIProvider:
             raise ValueError("OpenAI не вернул полный структурированный ответ. Повторите анализ")
         return response.output_parsed
 
+    @staticmethod
+    def compact_functions(records):
+        """Comparison needs meaning and IDs, not repeated source paragraphs."""
+        fields = ("id", "owner", "action", "object", "scope")
+        return [{key: item[key] for key in fields} for item in records]
+
     def extract(self, clauses, context):
         return self.ask(Extraction, """
 Извлеки все явно закреплённые функции и подразделения/должности из target_clauses.
+Unit добавляй только из явного перечня оргструктуры или заголовка владельца в target_clauses,
+не из context и не из случайного упоминания.
 Каждая функция = owner, action, object, scope. Разбивай составные функции по смыслу.
+Если область ответственности не указана, напиши «не указана», не придумывай её.
 Сохраняй ограничения зоны ответственности. Общие нормы, запреты и правила не превращай
 в позитивные обязанности. Используй context только для определения владельца и области.
 Evidence: clause_id и ТОЧНАЯ непрерывная подстрока text длиной минимум 8 символов.
@@ -49,16 +58,35 @@ Evidence: clause_id и ТОЧНАЯ непрерывная подстрока te
 Не объявляй предметную специализацию новой функцией на этапе извлечения.
 """, {"context": context, "target_clauses": [c.model_dump() for c in clauses]})
 
+    def repair_extraction(self, clauses, context, previous, error):
+        return self.ask(Extraction, """
+Исправь результат извлечения, который не прошёл проверку источников.
+Верни полный исправленный Extraction этой части, сохрани все подтверждённые функции.
+Все clause_id должны существовать в target_clauses или context. Цитату копируй
+дословно из text ОДНОГО указанного фрагмента; не склеивай разные фрагменты,
+не сокращай многоточием и не пересказывай. Для нескольких источников создай
+несколько Evidence. Каждая функция и подразделение должны иметь хотя бы один
+источник из target_clauses. Не добавляй функцию только ради прохождения проверки.
+Если прежняя функция не имеет основания в источниках, исключи её.
+""", {"context": context, "target_clauses": [c.model_dump() for c in clauses],
+       "previous_extraction": previous.model_dump(), "validation_error": str(error)})
+
     def match(self, before, after):
         return self.ask(Matches, """
 Сопоставь КАЖДУЮ функцию before с полным каталогом after. Ровно один Match на before_id.
-Сравнивай действие, объект, владельца и scope, а не номера пунктов.
+Сравнивай действие, объект, владельца и scope, а не номера пунктов. unit_changes
+показывает, какие названия относятся к одному преобразованному подразделению.
 Одна функция может разделиться между несколькими владельцами. Учитывай переименования,
 перенумерацию и передачу между существующими подразделениями. after_ids только из каталога.
-not_found только после поиска по всему after; у него after_ids пуст. У остальных непуст.
-preserved: смысл и владелец сохранены; transferred: другой владелец; split: несколько
+not_found только если после поиска по всему after нет убедительного аналога; after_ids пуст.
+uncertain, если данные допускают несколько толкований или соответствие частичное:
+в after_ids перечисли не более трёх кандидатов либо оставь пустым. Не называй это потерей.
+У preserved, transferred, changed ровно один after_id; у split минимум два.
+preserved: смысл и подразделение сохранены, в том числе при подтверждённом переименовании;
+transferred: функция у другого подразделения; split: несколько
 частей/владельцев; changed: изменение содержания/объёма. Кратко объясни и дай рекомендацию.
-""", {"before": before, "after": after})
+""", {"before": self.compact_functions(before), "after": self.compact_functions(after),
+       "unit_changes": getattr(self, "unit_changes", [])})
 
     def risks(self, focus, catalog):
         return self.ask(Risks, """
@@ -70,13 +98,16 @@ preserved: смысл и владелец сохранены; transferred: др�
 Не считай разработку методологии внутреннего аудита конфликтом автоматически.
 function_ids — минимум два различных ID; explanation объясняет механизм риска.
 Если оснований нет — risks=[]. Риски рекомендательные, не установленное нарушение.
-""", {"focus": focus, "catalog": catalog})
+""", {"focus": self.compact_functions(focus), "catalog": self.compact_functions(catalog)})
 
     def units(self, before, after):
-        return self.ask(UnitChanges, """
+        result = self.ask(UnitChanges, """
 Сопоставь реестр подразделений И ролей до/после. Не смешивай роли с подразделениями.
 Используй только точные name из реестров, покрой каждый name обеих сторон хотя бы раз.
 preserved: тот же владелец; reorganized: переименование/разделение/слияние;
 created: отсутствует в before (before_names=[]); not_found: отсутствует в after.
 Для reorganized объясни основание; не додумывай юридическое упразднение.
-""", {"before": before, "after": after})
+""", {"before": [{"name": u["name"], "kind": u["kind"]} for u in before],
+       "after": [{"name": u["name"], "kind": u["kind"]} for u in after]})
+        self.unit_changes = [change.model_dump() for change in result.changes]
+        return result

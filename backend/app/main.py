@@ -8,7 +8,8 @@ from pathlib import Path
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import Response, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-from openai import AuthenticationError, RateLimitError, APIConnectionError, APIStatusError
+from openai import (AuthenticationError, RateLimitError, APIConnectionError, APIStatusError,
+                    BadRequestError, LengthFinishReasonError, ContentFilterFinishReasonError)
 from pymongo.errors import PyMongoError
 
 from .config import ROOT, Settings
@@ -126,8 +127,14 @@ def create_app(settings=None, provider_factory=None, store=None):
             store.update(pid, status="failed", error="OpenAI: квота или лимит запросов. Проверьте биллинг и повторите позднее", stage="Лимит OpenAI")
         except APIConnectionError:
             store.update(pid, status="failed", error="Нет соединения с OpenAI. Проверьте сеть", stage="Ошибка сети")
+        except BadRequestError:
+            store.update(pid, status="failed", error="OpenAI не принял запрос. Проверьте выбранную модель, доступ к ней и размер комплекта", stage="Ошибка запроса OpenAI")
         except APIStatusError:
             store.update(pid, status="failed", error="OpenAI отклонил запрос. Проверьте доступ к OPENAI_MODEL и повторите", stage="Ошибка OpenAI")
+        except LengthFinishReasonError:
+            store.update(pid, status="failed", error="Ответ модели превысил лимит. Разделите комплект на меньшие части", stage="Лимит ответа ИИ")
+        except ContentFilterFinishReasonError:
+            store.update(pid, status="failed", error="Модель не вернула результат из-за ограничения обработки", stage="Ограничение ИИ")
         except ValueError as exc:
             store.update(pid, status="failed", error=str(exc)[:1000], stage="Проверка анализа не пройдена")
         except Exception:
