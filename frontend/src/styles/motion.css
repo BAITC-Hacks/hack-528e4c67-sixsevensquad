@@ -1,0 +1,21 @@
+button, a, input, select, textarea, .upload-zone, .drop-area { transition: background-color 180ms ease, border-color 180ms ease, color 180ms ease, transform 180ms ease; }
+.button:hover:not(:disabled) { transform: translateY(-1px); } .button:active:not(:disabled) { transform: translateY(1px) scale(.985); }
+.sidebar { transition: transform 250ms cubic-bezier(.2,.7,.3,1), visibility 250ms; } .sidebar-nav button:hover svg, .history-nav:hover svg { transform: translateX(2px); } .sidebar-nav svg, .history-nav svg { transition: transform 180ms ease; }
+.page-transition { animation: enter-page 320ms cubic-bezier(.2,.7,.3,1) both; }
+.animate-row { animation: enter-row 320ms cubic-bezier(.2,.7,.3,1) both; }
+.summary-card:hover { transform: translateY(-3px); border-color: #b6cbee; } .summary-card:hover .summary-arrow { color: var(--blue); transform: translate(2px, -2px); } .summary-arrow { transition: color 200ms, transform 200ms; }
+.drop-area:hover .upload-icon, .is-dragging .upload-icon { transform: translateY(-4px); } .upload-icon { transition: transform 220ms cubic-bezier(.2,.7,.3,1); }
+.upload-file { animation: enter-row 240ms ease both; } .toast { animation: toast-in 280ms cubic-bezier(.2,.7,.3,1) both; } .request-indicator { animation: enter-row 250ms ease both; }
+.modal[open] { animation: dialog-in 240ms cubic-bezier(.2,.7,.3,1); } .modal[open]::backdrop { animation: fade-in 200ms ease; }
+details[open] > div, details[open] > blockquote, details[open] > p { animation: enter-row 220ms ease both; }
+.review-progress > span { transition: width 450ms cubic-bezier(.2,.7,.3,1); } .export-options { animation: menu-in 160ms ease both; transform-origin: top right; }
+.spin { animation: spin 1s linear infinite; } .progress-dots { display: flex; gap: 6px; padding: 0 8px; } .progress-dots i { width: 6px; height: 6px; border-radius: 50%; background: #7da2e8; animation: breathe 1.4s ease-in-out infinite; } .progress-dots i:nth-child(2) { animation-delay: 160ms; } .progress-dots i:nth-child(3) { animation-delay: 320ms; }
+@keyframes enter-page { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
+@keyframes enter-row { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+@keyframes dialog-in { from { opacity: 0; transform: translateY(12px) scale(.985); } to { opacity: 1; transform: none; } }
+@keyframes toast-in { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: none; } }
+@keyframes menu-in { from { opacity: 0; transform: translateY(-4px) scale(.98); } to { opacity: 1; transform: none; } }
+@keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
+@keyframes spin { to { transform: rotate(360deg); } }
+@keyframes breathe { 0%, 80%, 100% { opacity: .4; transform: scale(.85); } 40% { opacity: 1; transform: scale(1.2); } }
+@media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; scroll-behavior: auto !important; } }
