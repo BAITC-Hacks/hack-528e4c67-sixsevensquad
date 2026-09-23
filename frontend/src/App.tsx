@@ -55,8 +55,6 @@ function Drop({ title, files, setFiles }: { title: string; files: File[]; setFil
 }
 
 export default function App() {
-  const analysis = useAnalysis();
-  const { page, project, health, busy, connection } = analysis;
   const [before, setBefore] = useState<File[]>([]);
   const [after, setAfter] = useState<File[]>([]);
   const [project, setProject] = useState<Project | null>(null);
