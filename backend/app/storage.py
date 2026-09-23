@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from gridfs import GridFS
 from pymongo import MongoClient, ReturnDocument, DESCENDING
 from pymongo.server_api import ServerApi
+from .project_meta import summary
 
 
 class StorageUnavailable(RuntimeError):
@@ -68,6 +69,7 @@ class Store:
         blob = None
         if "result" in changes:
             result = changes.pop("result")
+            changes["counts"] = result.get("counts", {})
             blob = GridFS(db).put(json.dumps(result, ensure_ascii=False).encode(),
                 filename=f"{pid}.json", contentType="application/json")
             changes["result_file"] = blob
@@ -84,8 +86,9 @@ class Store:
 
     def start(self, pid, mode):
         doc = self.connect().projects.find_one_and_update(
-            {"_id":pid, "status":{"$in":["ready","failed"]}, "result_file":None},
-            {"$set":{"status":"running", "stage":"В очереди", "mode":mode, "error":None}},
+            {"_id":pid, "status":{"$in":["ready","failed","cancelled"]}, "result_file":None},
+            {"$set":{"status":"running", "stage":"В очереди", "mode":mode, "error":None,
+                      "started":now(), "finished":None}, "$inc":{"attempts":1}},
             return_document=ReturnDocument.AFTER)
         if doc is None:
             existing = self.connect().projects.find_one({"_id":pid}, {"status":1})
@@ -105,8 +108,33 @@ class Store:
         return value
 
     def list(self):
-        cursor = self.connect().projects.find({}, {"created":1,"status":1,"stage":1}).sort("created", DESCENDING).limit(100)
-        return [{"id":p.pop("_id"), **p} for p in cursor]
+        fields = {k:1 for k in ("created", "status", "stage", "error", "started", "finished", "metrics", "attempts", "mode", "counts", "reviews", "documents.name", "documents.side", "documents.clauses.id")}
+        cursor = self.connect().projects.find({}, fields).sort("created", DESCENDING).limit(100)
+        return [summary({"id":p.pop("_id"), **p}) for p in cursor]
+
+    def cache_get(self, pid, key):
+        db = self.connect()
+        cached = db.analysis_cache.find_one({"_id":f"{pid}:{key}"})
+        return json.loads(GridFS(db).get(cached["file"]).read()) if cached else None
+
+    def status(self, pid):
+        fields = {k:1 for k in ("created", "status", "stage", "error", "started", "finished", "metrics", "attempts", "mode", "counts", "reviews", "documents.name", "documents.side", "documents.clauses.id")}
+        p = self.connect().projects.find_one({"_id":pid}, fields)
+        if p is None:
+            raise KeyError(pid)
+        return summary({"id":p.pop("_id"), **p})
+
+    def cache_put(self, pid, key, value):
+        db = self.connect()
+        blob = GridFS(db).put(json.dumps(value, ensure_ascii=False).encode())
+        try:
+            old = db.analysis_cache.find_one_and_replace({"_id":f"{pid}:{key}"},
+                {"_id":f"{pid}:{key}", "file":blob}, upsert=True)
+        except Exception:
+            GridFS(db).delete(blob)
+            raise
+        if old:
+            GridFS(db).delete(old["file"])
 
     def recover(self):
         self.connect().projects.update_many({"status":"running"}, {"$set":{

@@ -1,6 +1,8 @@
 import json
 import csv
 import io
+import logging
+from threading import Event, Lock
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -8,7 +10,7 @@ from pathlib import Path
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import Response, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-from openai import (AuthenticationError, RateLimitError, APIConnectionError, APIStatusError,
+from openai import (AuthenticationError, RateLimitError, APIConnectionError, APIStatusError, APITimeoutError,
                     BadRequestError, LengthFinishReasonError, ContentFilterFinishReasonError)
 from pymongo.errors import PyMongoError
 
@@ -16,15 +18,19 @@ from .config import ROOT, Settings
 from .schemas import AnalysisRequest, Document, Review
 from .parsers import parse_document, MAX_BYTES
 from .pipeline import analyze, build_report
-from .provider import OpenAIProvider
+from .provider import OpenAIProvider, AnalysisCancelled
 from .baseline import BaselineProvider
 from .storage import Store, StorageUnavailable
 from .memory_storage import MemoryStore
+from .local_storage import LocalStore
+from .storage import now
 
 def create_app(settings=None, provider_factory=None, store=None):
     settings = settings or Settings()
-    store = store if store is not None else MemoryStore() if settings.kontur_storage == "memory" else Store(settings)
+    store = store if store is not None else (LocalStore(settings.kontur_data_dir) if settings.kontur_storage == "local" else MemoryStore() if settings.kontur_storage == "memory" else Store(settings))
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="kontur")
+    job_lock = Lock()
+    cancellations = {}
     @asynccontextmanager
     async def lifespan(app):
         try:
@@ -33,9 +39,11 @@ def create_app(settings=None, provider_factory=None, store=None):
                     store.initialize()
                     store.recover()
                 except (PyMongoError, ValueError):
-                    raise RuntimeError("MongoDB недоступна: проверьте MONGODB_URI, пользователя и IP Access List в Atlas") from None
+                    raise RuntimeError("Хранилище недоступно: проверьте локальные файлы или настройки MongoDB") from None
             yield
         finally:
+            for event in list(cancellations.values()):
+                event.set()
             executor.shutdown(wait=True, cancel_futures=False)
             store.close()
     app = FastAPI(title="Контур API", version="0.1.0", lifespan=lifespan)
@@ -60,12 +68,14 @@ def create_app(settings=None, provider_factory=None, store=None):
         if store.configured:
             try:
                 store.ping()
-                database = "memory" if isinstance(store, MemoryStore) else "connected"
+                database = "local" if isinstance(store, LocalStore) else "memory" if isinstance(store, MemoryStore) else "connected"
             except (PyMongoError, ValueError):
                 database = "unavailable"
-        return {"status":"ok" if database in {"connected", "memory"} else "degraded", "database":database,
+        return {"status":"ok" if database in {"connected", "memory", "local"} else "degraded", "database":database,
             "openai_configured":bool(settings.openai_api_key.get_secret_value()), "model":settings.openai_model,
-            "formats":["txt","docx","pdf","xlsx"], "max_file_mb":10}
+            "formats":["txt","docx","pdf","xlsx"], "max_file_mb":10,
+            "budget_usd":settings.kontur_budget_usd, "max_calls":settings.kontur_max_calls,
+            "analysis_seconds":settings.kontur_analysis_seconds}
 
     @app.get("/api/projects")
     def projects():
@@ -111,20 +121,52 @@ def create_app(settings=None, provider_factory=None, store=None):
     @app.get("/api/projects/{pid}")
     def project(pid: str):
         p = store.get(pid)
+        p.pop("_cache", None)
         if p["result"]:
             p["result"]["report"] = build_report(p["result"], p["reviews"])
         return p
 
+    @app.get("/api/projects/{pid}/status")
+    def project_status(pid: str):
+        return store.status(pid)
+
+    @app.post("/api/projects/{pid}/cancel")
+    def cancel(pid: str):
+        with job_lock:
+            p = store.get(pid)
+            if p["status"] != "running" or pid not in cancellations:
+                raise HTTPException(409, "Этот анализ сейчас не выполняется")
+            cancellations[pid].set()
+            store.update(pid, stage="Остановка: ожидаем завершения текущего запроса")
+        return {"status":"cancelling"}
+
     def run(pid, mode):
+        provider = None
         try:
-            provider = provider_factory(mode) if provider_factory else OpenAIProvider(settings) if mode == "openai" else BaselineProvider()
+            event = cancellations[pid]
+            provider = provider_factory(mode) if provider_factory else OpenAIProvider(settings,
+                cache_get=lambda key:store.cache_get(pid, key),
+                cache_put=lambda key,value:store.cache_put(pid, key,value),
+                metrics=store.get(pid).get("metrics"),
+                on_metrics=lambda metrics:store.update(pid, metrics=metrics),
+                cancelled=event.is_set) if mode == "openai" else BaselineProvider()
             documents = [Document.model_validate(d) for d in store.get(pid)["documents"]]
-            result = analyze(documents, provider, mode, lambda stage:store.update(pid, stage=stage))
-            store.update(pid, status="completed", stage="Анализ завершён", result=result)
+            def progress(stage):
+                if event.is_set():
+                    raise AnalysisCancelled("Анализ остановлен; завершённые запросы сохранены")
+                store.update(pid, stage=stage)
+            result = analyze(documents, provider, mode, progress)
+            if event.is_set():
+                raise AnalysisCancelled("Анализ остановлен; завершённые запросы сохранены")
+            store.update(pid, status="completed", stage="Анализ завершён с замечаниями" if result.get("warnings") else "Анализ завершён", result=result)
+        except AnalysisCancelled as exc:
+            store.update(pid, status="cancelled", error=None, stage=str(exc))
         except AuthenticationError:
             store.update(pid, status="failed", error="OpenAI отклонил ключ. Проверьте OPENAI_API_KEY в .env", stage="Ошибка авторизации")
         except RateLimitError:
             store.update(pid, status="failed", error="OpenAI: квота или лимит запросов. Проверьте биллинг и повторите позднее", stage="Лимит OpenAI")
+        except APITimeoutError:
+            store.update(pid, status="failed", error="OpenAI не ответил за отведённое время. Готовые ответы сохранены; можно продолжить анализ", stage="Время ожидания OpenAI истекло")
         except APIConnectionError:
             store.update(pid, status="failed", error="Нет соединения с OpenAI. Проверьте сеть", stage="Ошибка сети")
         except BadRequestError:
@@ -138,17 +180,28 @@ def create_app(settings=None, provider_factory=None, store=None):
         except ValueError as exc:
             store.update(pid, status="failed", error=str(exc)[:1000], stage="Проверка анализа не пройдена")
         except Exception:
+            logging.getLogger(__name__).exception("Analysis failed for project %s", pid)
             store.update(pid, status="failed", error="Внутренняя ошибка обработки. Результат не опубликован", stage="Ошибка")
+        finally:
+            try:
+                store.update(pid, finished=now())
+            finally:
+                with job_lock:
+                    cancellations.pop(pid, None)
 
     @app.post("/api/projects/{pid}/analyze", status_code=202)
     def start(pid: str, request: AnalysisRequest):
         if request.mode == "openai" and not settings.openai_api_key.get_secret_value() and not provider_factory:
             raise HTTPException(503, "Добавьте OPENAI_API_KEY в .env и перезапустите сервер. Ключ не отправляется в браузер")
-        try:
-            p = store.start(pid, request.mode)
-        except ValueError as exc:
-            raise HTTPException(409, str(exc)) from None
-        executor.submit(run, pid, request.mode)
+        with job_lock:
+            if cancellations:
+                raise HTTPException(409, "Уже выполняется анализ. Дождитесь завершения или остановите его в истории")
+            try:
+                p = store.start(pid, request.mode)
+            except ValueError as exc:
+                raise HTTPException(409, str(exc)) from None
+            cancellations[pid] = Event()
+            executor.submit(run, pid, request.mode)
         return {"id":pid, "status":p["status"]}
 
     @app.put("/api/projects/{pid}/findings/{fid}/review")
@@ -170,9 +223,10 @@ def create_app(settings=None, provider_factory=None, store=None):
             writer.writerow(["ID", "Статус", "Функция", "Пояснение", "Рекомендация", "Источники", "Решение аналитика"])
             for finding in p["result"]["findings"]:
                 sources = " | ".join(f"{e['document']}, {e['locator']}: {e['quote']}" for e in finding["evidence"])
-                writer.writerow([finding["id"], finding["label"], finding["title"], finding["explanation"],
+                row = [finding["id"], finding["label"], finding["title"], finding["explanation"],
                                  finding["recommendation"], sources,
-                                 p["reviews"].get(finding["id"], {}).get("decision", "pending")])
+                                 p["reviews"].get(finding["id"], {}).get("decision", "pending")]
+                writer.writerow(["'"+str(value) if str(value).lstrip().startswith(("=", "+", "-", "@", "\t", "\r")) else value for value in row])
             body, media = "\ufeff" + output.getvalue(), "text/csv; charset=utf-8"
         elif format == "docx":
             from docx import Document as WordDocument

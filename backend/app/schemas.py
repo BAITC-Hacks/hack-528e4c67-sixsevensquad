@@ -63,7 +63,7 @@ class Risks(BaseModel):
 class UnitChange(BaseModel):
     before_names: list[str]
     after_names: list[str]
-    status: Literal["preserved", "reorganized", "created", "not_found"]
+    status: Literal["preserved", "reorganized", "created", "not_found", "uncertain"]
     explanation: str
 
 class UnitChanges(BaseModel):

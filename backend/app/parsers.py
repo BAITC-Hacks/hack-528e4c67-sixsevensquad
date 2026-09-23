@@ -8,7 +8,7 @@ from pathlib import Path
 from .schemas import Clause, Document, Side
 
 MAX_BYTES = 10 * 1024 * 1024
-NUMBER = re.compile(r"^(\d+(?:\.\d+)+)\.?\s*(.*)$")
+NUMBER = re.compile(r"^(\d+(?:\.\d+)*)(?:\.|\))?\s+(.+)$")
 
 def pdf_blocks(content: str, page: int) -> list[tuple[str, str]]:
     """Reassemble PDF text runs; retain page and physical line provenance.
@@ -55,7 +55,13 @@ def parse_document(name: str, data: bytes, side: Side, document_id: str) -> Docu
                 raise ValueError("Слишком большой распакованный документ")
     blocks: list[tuple[str, str]] = []
     if suffix == ".txt":
-        blocks = [(f"строка {i}", line) for i, line in enumerate(data.decode("utf-8-sig").splitlines(), 1)]
+        try:
+            text = data.decode("utf-16") if data.startswith((b"\xff\xfe", b"\xfe\xff")) else data.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            raise ValueError("TXT: сохраните файл в UTF-8 или UTF-16 с BOM") from None
+        if "\x00" in text:
+            raise ValueError("TXT содержит двоичные данные; сохраните текст в UTF-8")
+        blocks = [(f"строка {i}", line) for i, line in enumerate(text.splitlines(), 1)]
     elif suffix == ".docx":
         from docx import Document as WordDocument
         from docx.table import Table
@@ -85,10 +91,14 @@ def parse_document(name: str, data: bytes, side: Side, document_id: str) -> Docu
             for sheet in book:
                 if sheet.max_row and sheet.max_row > 20000:
                     raise ValueError("Excel: максимум 20000 строк на лист")
+                if sheet.max_column and sheet.max_column > 200:
+                    raise ValueError("Excel: максимум 200 столбцов на лист")
                 for i, row in enumerate(sheet.iter_rows(values_only=True), 1):
                     text = " | ".join(str(c) for c in row if c is not None)
                     if text.strip():
                         blocks.append((f"лист {sheet.title}, строка {i}", text))
+                    if len(blocks) > 20000:
+                        raise ValueError("Excel: максимум 20000 непустых строк в книге")
         finally:
             book.close()
     else:
@@ -106,7 +116,15 @@ def parse_document(name: str, data: bytes, side: Side, document_id: str) -> Docu
             current_number = ""
         if current_number:
             locator = f"п. {current_number}; {locator}"
-        clauses.append(Clause(id=f"{document_id}:c{len(clauses)+1}", document=name, side=side, locator=locator, text=text))
+        while text:
+            end = min(len(text), 6000)
+            if end < len(text):
+                boundary = text.rfind(" ", 0, end)
+                if boundary > 0:
+                    end = boundary
+            excerpt = text[:end].strip()
+            clauses.append(Clause(id=f"{document_id}:c{len(clauses)+1}", document=name, side=side, locator=locator, text=excerpt))
+            text = text[end:].lstrip()
     if not clauses or sum(len(c.text) for c in clauses) < 20:
         raise ValueError("В документе недостаточно извлекаемого текста")
     return Document(id=document_id, name=name, side=side, sha256=hashlib.sha256(data).hexdigest(), clauses=clauses)

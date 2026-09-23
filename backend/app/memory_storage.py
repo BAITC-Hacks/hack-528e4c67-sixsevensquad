@@ -5,6 +5,7 @@ import re
 import uuid
 
 from .storage import now
+from .project_meta import summary
 
 
 class MemoryStore:
@@ -21,7 +22,10 @@ class MemoryStore:
         pass
 
     def recover(self):
-        pass
+        for pid, p in list(self.projects.items()):
+            if p["status"] == "running":
+                self.update(pid, status="failed", stage="Прервано перезапуском сервера",
+                            error="Можно продолжить: завершённые запросы сохранены", finished=now())
 
     def close(self):
         pass
@@ -41,7 +45,21 @@ class MemoryStore:
     def list(self):
         with self.lock:
             rows = sorted(self.projects.values(), key=lambda p: p["created"], reverse=True)[:100]
-            return [{k: p[k] for k in ("id", "created", "status", "stage")} for p in rows]
+            return [summary(p) for p in rows]
+
+    def status(self, pid):
+        with self.lock:
+            return deepcopy(summary(self.projects[pid]))
+
+    def cache_get(self, pid, key):
+        with self.lock:
+            return deepcopy(self.projects[pid].get("_cache", {}).get(key))
+
+    def cache_put(self, pid, key, value):
+        with self.lock:
+            cache = deepcopy(self.projects[pid].get("_cache", {}))
+            cache[key] = value
+            self.update(pid, _cache=cache)
 
     def update(self, pid, **changes):
         with self.lock:
@@ -52,9 +70,10 @@ class MemoryStore:
     def start(self, pid, mode):
         with self.lock:
             p = self.projects[pid]
-            if p["status"] not in {"ready", "failed"} or p["result"] is not None:
+            if p["status"] not in {"ready", "failed", "cancelled"} or p["result"] is not None:
                 raise ValueError("Анализ уже запущен или результат сохранён. Для нового анализа создайте проект")
-            self.update(pid, status="running", stage="В очереди", mode=mode, error=None)
+            self.update(pid, status="running", stage="В очереди", mode=mode, error=None,
+                        started=now(), finished=None, attempts=p.get("attempts", 0)+1)
             return self.get(pid)
 
     def review(self, pid, finding_id, review):
@@ -63,5 +82,7 @@ class MemoryStore:
             if not re.fullmatch(r"finding-\d+", finding_id) or not p["result"] or finding_id not in {f["id"] for f in p["result"]["findings"]}:
                 raise KeyError(finding_id)
             value = {**deepcopy(review), "updated": now()}
-            p["reviews"][finding_id] = value
+            reviews = deepcopy(p["reviews"])
+            reviews[finding_id] = value
+            self.update(pid, reviews=reviews)
             return deepcopy(value)

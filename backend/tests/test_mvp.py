@@ -28,7 +28,7 @@ def test_pdf_words_are_reassembled_without_losing_source_text():
     assert normalize(" ".join(text for _, text in blocks)) == normalize(raw)
 
 
-def test_paraphrased_citation_is_anchored_to_exact_source():
+def test_paraphrased_citation_is_not_silently_replaced():
     class ParaphraseProvider(BaselineProvider):
         extracts = 0
 
@@ -41,10 +41,8 @@ def test_paraphrased_citation_is_anchored_to_exact_source():
 
     provider = ParaphraseProvider()
     stages = []
-    result = analyze(fixture_documents("control"), provider, "openai", stages.append)
-    assert result["findings"]
-    assert all(e["quote"] in e["text"] for f in result["findings"] for e in f["evidence"])
-    assert not any("Уточнение цитат" in stage for stage in stages)
+    with pytest.raises(EvidenceError, match="Цитата отсутствует"):
+        analyze(fixture_documents("control"), provider, "openai", stages.append)
 
 
 def test_unknown_clause_id_is_still_rejected():
