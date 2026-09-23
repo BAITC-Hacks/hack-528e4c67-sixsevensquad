@@ -1,38 +1,78 @@
-from __future__ import annotations
-
-from io import BytesIO
+"""Parse documents without inventing page numbers or rewriting quoted text."""
+import hashlib
+import io
+import re
+import zipfile
 from pathlib import Path
 
-from docx import Document
-from openpyxl import load_workbook
-from pypdf import PdfReader
+from .schemas import Clause, Document, Side
 
-from .analyzer import clean_text
+MAX_BYTES = 10 * 1024 * 1024
+NUMBER = re.compile(r"^(\d+(?:\.\d+)+)\.?\s*(.*)$")
 
-
-def parse_file(filename: str, content: bytes) -> str:
-    suffix = Path(filename).suffix.lower()
-    if suffix in {".txt", ".md"}:
-        return clean_text(content.decode("utf-8", errors="ignore"))
-    if suffix == ".pdf":
-        reader = PdfReader(BytesIO(content))
-        return clean_text("\n".join(page.extract_text() or "" for page in reader.pages))
-    if suffix == ".docx":
-        document = Document(BytesIO(content))
-        blocks = [paragraph.text for paragraph in document.paragraphs]
-        for table in document.tables:
-            for row in table.rows:
-                blocks.append(" | ".join(cell.text for cell in row.cells))
-        return clean_text("\n".join(blocks))
-    if suffix in {".xlsx", ".xlsm"}:
-        workbook = load_workbook(BytesIO(content), read_only=True, data_only=True)
-        rows: list[str] = []
-        for sheet in workbook.worksheets:
-            rows.append(f"Лист: {sheet.title}")
-            for row in sheet.iter_rows(values_only=True):
-                values = [str(value).strip() for value in row if value is not None]
-                if values:
-                    rows.append(" | ".join(values))
-        return clean_text("\n".join(rows))
-    raise ValueError(f"Формат {suffix or 'без расширения'} пока не поддерживается")
-
+def parse_document(name: str, data: bytes, side: Side, document_id: str) -> Document:
+    name = Path(name.replace("\\", "/")).name
+    if not data or len(data) > MAX_BYTES:
+        raise ValueError("Файл пуст или превышает 10 МБ")
+    suffix = Path(name).suffix.lower()
+    if suffix in {".docx", ".xlsx"}:
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            if sum(x.file_size for x in archive.infolist()) > 60 * 1024 * 1024:
+                raise ValueError("Слишком большой распакованный документ")
+    blocks: list[tuple[str, str]] = []
+    if suffix == ".txt":
+        blocks = [(f"строка {i}", line) for i, line in enumerate(data.decode("utf-8-sig").splitlines(), 1)]
+    elif suffix == ".docx":
+        from docx import Document as WordDocument
+        from docx.table import Table
+        doc = WordDocument(io.BytesIO(data))
+        for i, block in enumerate(doc.iter_inner_content(), 1):
+            if isinstance(block, Table):
+                for j, row in enumerate(block.rows, 1):
+                    blocks.append((f"блок {i}, строка таблицы {j}", " | ".join(c.text for c in row.cells)))
+            else:
+                blocks.append((f"абзац {i}", block.text))
+    elif suffix == ".pdf":
+        from pypdf import PdfReader
+        reader = PdfReader(io.BytesIO(data))
+        if reader.is_encrypted:
+            raise ValueError("PDF зашифрован. Загрузите незашифрованную копию")
+        if len(reader.pages) > 200:
+            raise ValueError("Максимум 200 страниц PDF")
+        for i, page in enumerate(reader.pages, 1):
+            content = page.extract_text() or ""
+            if len(content.strip()) < 10:
+                raise ValueError(f"PDF: страница {i} без текста. Сначала выполните OCR; неполный анализ запрещён")
+            blocks.extend((f"стр. {i}, строка {j}", line) for j, line in enumerate(content.splitlines(), 1))
+    elif suffix == ".xlsx":
+        from openpyxl import load_workbook
+        book = load_workbook(io.BytesIO(data), read_only=True, data_only=False)
+        try:
+            for sheet in book:
+                if sheet.max_row and sheet.max_row > 20000:
+                    raise ValueError("Excel: максимум 20000 строк на лист")
+                for i, row in enumerate(sheet.iter_rows(values_only=True), 1):
+                    text = " | ".join(str(c) for c in row if c is not None)
+                    if text.strip():
+                        blocks.append((f"лист {sheet.title}, строка {i}", text))
+        finally:
+            book.close()
+    else:
+        raise ValueError("Поддерживаются .txt, .docx, .pdf с текстом, .xlsx. Старые .doc/.xls нужно пересохранить")
+    clauses: list[Clause] = []
+    current_number = ""
+    for locator, text in blocks:
+        text = text.strip()
+        if not text:
+            continue
+        match = NUMBER.match(text)
+        if match:
+            current_number = match.group(1)
+        elif not re.match(r"^[а-яa-z][.)]\s|^[-–•]\s", text, re.I):
+            current_number = ""
+        if current_number:
+            locator = f"п. {current_number}; {locator}"
+        clauses.append(Clause(id=f"{document_id}:c{len(clauses)+1}", document=name, side=side, locator=locator, text=text))
+    if not clauses or sum(len(c.text) for c in clauses) < 20:
+        raise ValueError("В документе недостаточно извлекаемого текста")
+    return Document(id=document_id, name=name, side=side, sha256=hashlib.sha256(data).hexdigest(), clauses=clauses)
